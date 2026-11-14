@@ -80,11 +80,13 @@ jobs:
           /tmp/venv/bin/pip install -q --upgrade pip
           /tmp/venv/bin/pip install -q websockify
           git clone --depth 1 https://github.com/novnc/noVNC /tmp/noVNC
+          ls /tmp/noVNC/vnc.html /tmp/noVNC/vnc_lite.html
           nohup /tmp/venv/bin/websockify --web /tmp/noVNC 6080 127.0.0.1:5900 \
             > /tmp/novnc.log 2>&1 &
           sleep 6
           cat /tmp/novnc.log
-          curl -sI http://127.0.0.1:6080/vnc.html | head -3
+          echo -n "local vnc.html status: "
+          curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:6080/vnc.html
 
       - name: Tunnels + keep alive
         run: |
@@ -99,26 +101,35 @@ jobs:
             T=$!
             WEB=""; RAW=""
             for i in $(seq 1 45); do
-              WEB=$(grep -oE 'https://[a-z0-9-]+[a-z0-9.-]*pinggy[a-z0-9.-]*' /tmp/web.log | head -1)
+              # pinggy.io wale promo/dashboard links ko DROP karo
+              WEB=$(grep -oE 'https://[A-Za-z0-9._-]+' /tmp/web.log | grep -v 'pinggy\.io' | head -1)
               RAW=$(grep -oE 'tcp://[^ ]+' /tmp/tcp.log | head -1 | sed 's|tcp://||')
               [ -n "$WEB" ] && [ -n "$RAW" ] && break
               sleep 2
             done
             echo "=============================================================="
-            echo "BROWSER LINK (Chrome me khol):"
-            echo "${WEB:-FAILED}/vnc.html?autoconnect=true&password=mac12345&resize=scale&reconnect=true&path=websockify"
+            echo "BROWSER LINK  (poora copy kar, ? ke baad ka hissa zaroori):"
+            if [ -n "$WEB" ]; then
+              echo "${WEB}/vnc.html?autoconnect=true&password=mac12345&resize=scale&reconnect=true&path=websockify"
+            else
+              echo "FAILED - neeche raw log dekh"
+            fi
             echo ""
-            echo "VNC APP ADDRESS (RealVNC/Remmina):"
-            echo "${RAW:-FAILED}   password: mac12345"
+            echo "VNC APP ADDRESS (RealVNC / Remmina):"
+            echo "${RAW:-FAILED}    password: mac12345"
             echo ""
             echo "console user: $(stat -f%Su /dev/console)  pass: $(cat /tmp/cpw 2>/dev/null)"
             echo "time (UTC): $(date -u)"
             echo "=============================================================="
-            [ -z "$WEB" ] && cat /tmp/web.log
+            echo "--- RAW WEB LOG (yahan se manually bhi utha sakta hai) ---"
+            cat /tmp/web.log
+            echo "--- RAW TCP LOG ---"
+            cat /tmp/tcp.log
+            echo "------------------------------------------------------------"
             for m in $(seq 1 50); do
               sleep 60
               kill -0 "$W" 2>/dev/null || { echo "web tunnel died ${m}m"; break; }
-              [ $((m % 5)) -eq 0 ] && echo "[alive ${m}m] ${WEB}"
+              [ $((m % 5)) -eq 0 ] && echo "[alive ${m}m] ${WEB}/vnc.html?autoconnect=true&password=mac12345&resize=scale&reconnect=true&path=websockify"
             done
             kill "$W" "$T" 2>/dev/null; wait "$W" "$T" 2>/dev/null
             echo "rotating tunnels..."
