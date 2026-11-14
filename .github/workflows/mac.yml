@@ -1,0 +1,68 @@
+name: mac-vnc
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mac:
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Join tailnet
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: mac-ci
+          version: latest
+
+      - name: Create admin user
+        run: |
+          sudo dscl . -create /Users/macuser
+          sudo dscl . -create /Users/macuser UserShell /bin/zsh
+          sudo dscl . -create /Users/macuser RealName "Mac User"
+          sudo dscl . -create /Users/macuser UniqueID 1001
+          sudo dscl . -create /Users/macuser PrimaryGroupID 80
+          sudo dscl . -create /Users/macuser NFSHomeDirectory /Users/macuser
+          sudo dscl . -passwd /Users/macuser 'Mac@12345'
+          sudo createhomedir -c -u macuser > /dev/null
+          sudo dseditgroup -o edit -a macuser -t user admin
+
+      - name: Enable Screen Sharing + VNC password
+        run: |
+          KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          sudo $KS -configure -allowAccessFor -allUsers -privs -all || true
+          sudo $KS -configure -clientopts -setvnclegacy -vnclegacy yes || true
+          # legacy VNC password hash (XOR, max 8 chars) -> "mac12345"
+          echo "7A55325FB99BF1D7" | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
+          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
+          sudo launchctl enable system/com.apple.screensharing
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
+          sudo $KS -activate -restart -agent -console || true
+
+      - name: Grant TCC screen capture + control
+        run: |
+          DB="/Library/Application Support/com.apple.TCC/TCC.db"
+          E=$(date +%s)
+          for SVC in kTCCServiceScreenCapture kTCCServicePostEvent; do
+            sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access
+              (service,client,client_type,auth_value,auth_reason,auth_version,
+               indirect_object_identifier_type,flags,last_modified,last_reminded)
+              VALUES('$SVC','com.apple.screensharing.agent',0,2,4,1,0,0,$E,$E);" || true
+          done
+          sudo pkill screensharingd || true
+
+      - name: Show address
+        run: |
+          echo "=============================="
+          tailscale ip -4
+          echo "user: macuser   pass: Mac@12345"
+          echo "vnc legacy pass: mac12345"
+          sw_vers
+          csrutil status
+          sudo lsof -i :5900 || echo "WARN: 5900 not listening"
+          echo "=============================="
+
+      - name: Keep alive
+        run: |
+          for i in $(seq 1 340); do echo "alive $i"; sleep 60; done
