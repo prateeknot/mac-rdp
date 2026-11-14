@@ -11,26 +11,27 @@ jobs:
     steps:
       - name: Facts
         run: |
-          sw_vers; csrutil status
-          echo "console user: $(stat -f%Su /dev/console)"
+          sw_vers
+          csrutil status
+          CU=$(stat -f%Su /dev/console)
+          echo "console user: $CU"
+          echo "CONSOLE_USER=$CU" >> "$GITHUB_ENV"
           sudo ls -l /etc/kcpassword || echo "no kcpassword"
 
-      - name: Decode console user password
+      - name: Decode console password
         run: |
-          CU=$(stat -f%Su /dev/console)
-          echo "CONSOLE_USER=$CU" >> "$GITHUB_ENV"
           sudo python3 - <<'PY' > /tmp/cpw
           k=[125,137,82,35,210,188,221,234,163,185,31]
           d=open('/etc/kcpassword','rb').read()
           print(bytes(b^k[i%11] for i,b in enumerate(d)).rstrip(b'\x00').decode('utf-8','replace'))
           PY
           sudo chmod 644 /tmp/cpw
-          echo "console password: $(cat /tmp/cpw)"
+          echo "console user : $(stat -f%Su /dev/console)"
+          echo "console pass : $(cat /tmp/cpw)"
 
       - name: ARD OFF + standalone Screen Sharing ON
         run: |
           KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          # CRITICAL: 26.6.1+ me ARD active hone par legacy VNC dead hota hai
           sudo "$KS" -deactivate -configure -access -off -stop || true
           sudo rm -f /Library/Preferences/com.apple.RemoteManagement.plist || true
           sudo rm -rf /var/db/RemoteManagement || true
@@ -38,22 +39,25 @@ jobs:
           sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null \
             || sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
 
-      - name: Legacy VNC password + console attach
+      - name: Legacy VNC password (full 32-char hash)
         run: |
-          # "mac12345" ka VNCSettings XOR hash
-          echo "7A55325FB99BF1D7" | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
-          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
-          sudo chown root:wheel /Library/Preferences/com.apple.VNCSettings.txt
+          F=/Library/Preferences/com.apple.VNCSettings.txt
+          sudo rm -f "$F"
+          echo "7A55325FB99BF1D7FF1C39567390ADCA" | sudo tee "$F" >/dev/null
+          sudo chown root:wheel "$F"
+          sudo chmod 400 "$F"
+          sudo ls -l "$F"
+          echo -n "hash: "; sudo cat "$F"
           P=/Library/Preferences/com.apple.RemoteManagement
           sudo defaults write $P VNCLegacyConnectionsEnabled -bool true
           sudo defaults write $P VNCAlwaysStartOnConsole -bool true
-          sudo defaults write $P LoadRemoteManagementMenuExtra -bool false || true
+          sudo defaults read $P || true
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
           CU=$(stat -f%Su /dev/console)
           sudo dseditgroup -o create -q com.apple.access_screensharing || true
           sudo dseditgroup -o edit -a "$CU" -t user com.apple.access_screensharing || true
 
-      - name: TCC grants (SIP disabled hai, isliye possible)
+      - name: TCC grants
         run: |
           DB="/Library/Application Support/com.apple.TCC/TCC.db"
           E=$(date +%s)
@@ -65,12 +69,13 @@ jobs:
           done
           sudo sqlite3 "$DB" "SELECT service,auth_value FROM access WHERE client='com.apple.screensharing.agent';"
           sudo pkill screensharingd || true
-          sleep 3
+          sleep 4
+          sudo lsof -i :5900 || echo "WARN: 5900 not listening"
 
       - name: SELF TEST - real VNC login from localhost
         run: |
           cat > /tmp/probe.py <<'PY'
-          import socket,struct,sys
+          import socket,struct
           _IP=[58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7]
           _FP=[40,8,48,16,56,24,64,32,39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,36,4,44,12,52,20,60,28,35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25]
           _E=[32,1,2,3,4,5,4,5,6,7,8,9,8,9,10,11,12,13,12,13,14,15,16,17,16,17,18,19,20,21,20,21,22,23,24,25,24,25,26,27,28,29,28,29,30,31,32,1]
@@ -105,31 +110,48 @@ jobs:
               return r
           PW=b"mac12345"[:8].ljust(8,b'\x00')
           KEY=bytes(rev(b) for b in PW)
+          def rx(s,n):
+              b=b''
+              while len(b)<n:
+                  c=s.recv(n-len(b))
+                  if not c: raise EOFError("closed %d/%d"%(len(b),n))
+                  b+=c
+              return b
           def probe(ver):
-              s=socket.create_connection(('127.0.0.1',5900),10); s.settimeout(10)
-              v=s.recv(12); print("  server banner:",v.decode(errors='replace').strip())
-              s.sendall(ver); n=s.recv(1)
-              if not n: print("  closed"); s.close(); return None
-              if n[0]==0:
-                  ln=struct.unpack('>I',s.recv(4))[0]; print("  refused:",s.recv(ln).decode(errors='replace')); s.close(); return None
-              t=list(s.recv(n[0])); print("  security types:",t)
-              if 2 not in t: s.close(); return t
-              s.sendall(bytes([2])); ch=s.recv(16)
+              s=socket.create_connection(('127.0.0.1',5900),10); s.settimeout(15)
+              print("  banner:",rx(s,12).decode(errors='replace').strip())
+              s.sendall(ver); n=rx(s,1)[0]
+              if n==0:
+                  ln=struct.unpack('>I',rx(s,4))[0]
+                  print("  refused:",rx(s,ln).decode(errors='replace')); s.close(); return False
+              t=list(rx(s,n)); print("  security types:",t)
+              if 2 not in t:
+                  print("  type 2 (VNC password) missing"); s.close(); return False
+              s.sendall(bytes([2])); ch=rx(s,16)
               s.sendall(des(ch[:8],KEY)+des(ch[8:],KEY))
-              res=struct.unpack('>I',s.recv(4))[0]
-              print("  LEGACY VNC AUTH:", "SUCCESS ✅" if res==0 else "FAILED ❌")
-              s.close(); return t
-          print("=== probe as RFB 3.8 ===")
-          a=probe(b'RFB 003.008\n')
-          print("=== probe as RFB 3.889 (Apple) ===")
-          try: probe(b'RFB 003.889\n')
-          except Exception as e: print("  ",e)
-          if not a or 2 not in a:
-              print("\n>>> RESULT: legacy VNC (type 2) NOT offered. RealVNC/TightVNC connect nahi honge.")
-          else:
-              print("\n>>> RESULT: legacy VNC available. Windows/Linux viewer chalega.")
+              raw=rx(s,4); res=struct.unpack('>I',raw)[0]
+              print("  SecurityResult:",raw.hex(),"=",res)
+              if res==0:
+                  print("  LEGACY VNC AUTH: SUCCESS"); s.close(); return True
+              try:
+                  ln=struct.unpack('>I',rx(s,4))[0]
+                  print("  reason:",rx(s,ln).decode(errors='replace'))
+              except Exception: pass
+              print("  LEGACY VNC AUTH: FAILED"); s.close(); return False
+          ok=False
+          for v in (b'RFB 003.008\n', b'RFB 003.889\n'):
+              print("=== probe",v.decode().strip(),"===")
+              try: ok = probe(v) or ok
+              except Exception as e: print("  error:",repr(e))
+          print("")
+          print(">>> RESULT:", "VNC READY - viewer se connect kar" if ok else "AUTH FAIL - neeche diagnostics dekh")
           PY
           python3 /tmp/probe.py
+          echo "--- diagnostics ---"
+          sudo ls -l /Library/Preferences/com.apple.VNCSettings.txt
+          echo -n "hash: "; sudo cat /Library/Preferences/com.apple.VNCSettings.txt
+          sudo defaults read /Library/Preferences/com.apple.RemoteManagement || true
+          sudo launchctl print system/com.apple.screensharing 2>/dev/null | head -20 || true
 
       - name: Tunnel + keep alive
         run: |
@@ -143,21 +165,25 @@ jobs:
             P=$!; A=""
             for i in $(seq 1 40); do
               A=$(grep -oE 'tcp://[^ ]+' "$LOG" | head -1 | sed 's|tcp://||')
-              [ -n "$A" ] && break; sleep 2
+              [ -n "$A" ] && break
+              sleep 2
             done
             echo "=============================================="
             echo "VNC ADDRESS : ${A:-FAILED}"
             echo "VNC PASSWORD: mac12345"
-            echo "console user: $(stat -f%Su /dev/console)  pw: $(cat /tmp/cpw 2>/dev/null)"
-            echo "time: $(date -u)"
+            echo "console user: $(stat -f%Su /dev/console)"
+            echo "console pass: $(cat /tmp/cpw 2>/dev/null)"
+            echo "time (UTC)  : $(date -u)"
             echo "=============================================="
             [ -z "$A" ] && cat "$LOG"
             for m in $(seq 1 50); do
               sleep 60
-              kill -0 "$P" 2>/dev/null || { echo "tunnel died ${m}m, restart"; break; }
-              [ $((m % 5)) -eq 0 ] && echo "[alive ${m}m] $A"
+              kill -0 "$P" 2>/dev/null || { echo "tunnel died at ${m}m, restarting"; break; }
+              [ $((m % 5)) -eq 0 ] && echo "[alive ${m}m] VNC: $A"
             done
             kill "$P" 2>/dev/null; wait "$P" 2>/dev/null
+            echo "rotating tunnel (new address next)"
           done
           EOF
-          chmod +x /tmp/tun.sh; /tmp/tun.sh
+          chmod +x /tmp/tun.sh
+          /tmp/tun.sh
