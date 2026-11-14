@@ -12,7 +12,10 @@ jobs:
       - name: Facts
         run: |
           sw_vers; csrutil status
-          echo "console user: $(stat -f%Su /dev/console)"
+          CU=$(stat -f%Su /dev/console)
+          echo "console user: $CU"
+          echo "CU=$CU" >> "$GITHUB_ENV"
+          echo "CUID=$(id -u "$CU")" >> "$GITHUB_ENV"
 
       - name: Decode console password
         run: |
@@ -34,7 +37,7 @@ jobs:
           sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null \
             || sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
 
-      - name: VNC password (32-char hash, 400 perms)
+      - name: VNC password (32-char hash, 400)
         run: |
           F=/Library/Preferences/com.apple.VNCSettings.txt
           sudo rm -f "$F"
@@ -43,8 +46,7 @@ jobs:
           P=/Library/Preferences/com.apple.RemoteManagement
           sudo defaults write $P VNCLegacyConnectionsEnabled -bool true
           sudo defaults write $P VNCAlwaysStartOnConsole -bool true
-          sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
-          CU=$(stat -f%Su /dev/console)
+          sudo pmset -a displaysleep 0 sleep 0 disksleep 0 standby 0 || true
           sudo dseditgroup -o create -q com.apple.access_screensharing || true
           sudo dseditgroup -o edit -a "$CU" -t user com.apple.access_screensharing || true
 
@@ -58,11 +60,74 @@ jobs:
                indirect_object_identifier_type,flags,last_modified,last_reminded)
               VALUES('$SVC','com.apple.screensharing.agent',0,2,4,1,0,0,$E,$E);" || true
           done
+          for TGT in com.apple.systemevents com.apple.finder; do
+            sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access
+              (service,client,client_type,auth_value,auth_reason,auth_version,
+               indirect_object_identifier_type,indirect_object_identifier,flags,last_modified,last_reminded)
+              VALUES('kTCCServiceAppleEvents','/usr/bin/osascript',1,2,4,1,0,'$TGT',0,$E,$E);" || true
+          done
           sudo pkill screensharingd || true
           sleep 4
           sudo lsof -i :5900 || echo "WARN 5900 down"
 
-      - name: Check VNC auth type
+      - name: SPEED - animations off (as console user)
+        run: |
+          asu() { sudo launchctl asuser "$CUID" sudo -u "$CU" "$@"; }
+          asu defaults write -g NSAutomaticWindowAnimationsEnabled -bool false || true
+          asu defaults write -g NSWindowResizeTime -float 0.001 || true
+          asu defaults write -g QLPanelAnimationDuration -float 0 || true
+          asu defaults write -g NSScrollViewRubberbanding -bool false || true
+          asu defaults write -g AppleEnableSwipeNavigateWithScrolls -bool false || true
+          asu defaults write com.apple.dock launchanim -bool false || true
+          asu defaults write com.apple.dock autohide-time-modifier -float 0 || true
+          asu defaults write com.apple.dock autohide-delay -float 0 || true
+          asu defaults write com.apple.dock expose-animation-duration -float 0.1 || true
+          asu defaults write com.apple.dock mineffect -string scale || true
+          asu defaults write com.apple.dock magnification -bool false || true
+          asu defaults write com.apple.dock tilesize -int 36 || true
+          asu defaults write com.apple.dock show-recents -bool false || true
+          asu defaults write com.apple.universalaccess reduceTransparency -bool true || true
+          asu defaults write com.apple.universalaccess reduceMotion -bool true || true
+          asu defaults write com.apple.screensaver askForPassword -int 0 || true
+          asu defaults write com.apple.finder DisableAllAnimations -bool true || true
+          asu killall Dock || true
+          asu killall Finder || true
+          sudo mdutil -a -i off || true
+          sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -bool false || true
+
+      - name: SPEED - solid wallpaper
+        run: |
+          python3 - <<'PY'
+          import zlib,struct
+          W=H=64; c=(24,24,28)
+          raw=b''.join(b'\x00'+bytes(c)*W for _ in range(H))
+          def ch(t,d):
+              return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
+          png=b'\x89PNG\r\n\x1a\n'
+          png+=ch(b'IHDR',struct.pack('>IIBBBBB',W,H,8,2,0,0,0))
+          png+=ch(b'IDAT',zlib.compress(raw,9))+ch(b'IEND',b'')
+          open('/tmp/bg.png','wb').write(png)
+          print("bg.png written")
+          PY
+          sudo chmod 644 /tmp/bg.png
+          asu() { sudo launchctl asuser "$CUID" sudo -u "$CU" "$@"; }
+          asu osascript -e 'tell application "System Events" to set picture of every desktop to "/tmp/bg.png"' || true
+          asu osascript -e 'tell application "Finder" to set desktop picture to POSIX file "/tmp/bg.png"' || true
+
+      - name: SPEED - lower resolution
+        run: |
+          brew install displayplacer || true
+          export PATH="/opt/homebrew/bin:$PATH"
+          asu() { sudo launchctl asuser "$CUID" sudo -u "$CU" "$@"; }
+          asu displayplacer list || true
+          ID=$(asu displayplacer list 2>/dev/null | grep -m1 'Persistent screen id' | awk '{print $NF}')
+          echo "display id: $ID"
+          if [ -n "$ID" ]; then
+            asu displayplacer "id:$ID res:1280x720 hz:60 color_depth:8 scaling:off" || true
+          fi
+          asu displayplacer list | head -25 || true
+
+      - name: Verify VNC auth
         run: |
           python3 - <<'PY'
           import socket
@@ -70,69 +135,46 @@ jobs:
           print("banner:",s.recv(12).decode(errors='replace').strip())
           s.sendall(b'RFB 003.008\n'); n=s.recv(1)[0]
           t=list(s.recv(n)); print("security types:",t)
-          print("RESULT:", "OK - type 2 present" if 2 in t else "FAIL - no legacy VNC")
+          print("RESULT:", "OK - VncAuth ready" if 2 in t else "FAIL")
           s.close()
           PY
 
-      - name: Install noVNC + websockify
-        run: |
-          python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install -q --upgrade pip
-          /tmp/venv/bin/pip install -q websockify
-          git clone --depth 1 https://github.com/novnc/noVNC /tmp/noVNC
-          ls /tmp/noVNC/vnc.html /tmp/noVNC/vnc_lite.html
-          nohup /tmp/venv/bin/websockify --web /tmp/noVNC 6080 127.0.0.1:5900 \
-            > /tmp/novnc.log 2>&1 &
-          sleep 6
-          cat /tmp/novnc.log
-          echo -n "local vnc.html status: "
-          curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:6080/vnc.html
-
-      - name: Tunnels + keep alive
+      - name: Tunnel + keep alive
         run: |
           cat > /tmp/tun.sh <<'EOF'
           #!/bin/bash
-          SSHOPT="-p 443 -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes"
+          SSHOPT="-p 443 -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Compression=no -o Ciphers=aes128-gcm@openssh.com -o IPQoS=lowdelay -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o TCPKeepAlive=yes"
           while true; do
-            : > /tmp/web.log; : > /tmp/tcp.log
-            ssh $SSHOPT -R0:localhost:6080 free.pinggy.io >> /tmp/web.log 2>&1 &
-            W=$!
+            : > /tmp/tcp.log
             ssh $SSHOPT -R0:localhost:5900 tcp@free.pinggy.io >> /tmp/tcp.log 2>&1 &
             T=$!
-            WEB=""; RAW=""
+            A=""
             for i in $(seq 1 45); do
-              # pinggy.io wale promo/dashboard links ko DROP karo
-              WEB=$(grep -oE 'https://[A-Za-z0-9._-]+' /tmp/web.log | grep -v 'pinggy\.io' | head -1)
-              RAW=$(grep -oE 'tcp://[^ ]+' /tmp/tcp.log | head -1 | sed 's|tcp://||')
-              [ -n "$WEB" ] && [ -n "$RAW" ] && break
+              A=$(grep -oE 'tcp://[^ ]+' /tmp/tcp.log | head -1 | sed 's|tcp://||')
+              [ -n "$A" ] && break
               sleep 2
             done
             echo "=============================================================="
-            echo "BROWSER LINK  (poora copy kar, ? ke baad ka hissa zaroori):"
-            if [ -n "$WEB" ]; then
-              echo "${WEB}/vnc.html?autoconnect=true&password=mac12345&resize=scale&reconnect=true&path=websockify"
-            else
-              echo "FAILED - neeche raw log dekh"
-            fi
+            echo "TIGERVNC ADDRESS : ${A:-FAILED}"
+            echo "PASSWORD         : mac12345"
             echo ""
-            echo "VNC APP ADDRESS (RealVNC / Remmina):"
-            echo "${RAW:-FAILED}    password: mac12345"
+            echo "Windows:"
+            echo "vncviewer64-1.16.2.exe -AutoSelect=0 -PreferredEncoding=Tight -CustomCompressLevel=1 -CompressLevel=9 -QualityLevel=2 -FullColor=0 -LowColorLevel=1 -SecurityTypes=VncAuth -RemoteResize=0 -AlwaysCursor=1 -CursorType=Dot -PointerEventInterval=50 -AcceptClipboard=0 ${A}"
             echo ""
-            echo "console user: $(stat -f%Su /dev/console)  pass: $(cat /tmp/cpw 2>/dev/null)"
-            echo "time (UTC): $(date -u)"
+            echo "Linux:"
+            echo "vncviewer -AutoSelect=0 -PreferredEncoding=Tight -CustomCompressLevel=1 -CompressLevel=9 -QualityLevel=2 -FullColor=0 -LowColorLevel=1 -SecurityTypes=VncAuth -RemoteResize=0 -AlwaysCursor=1 -CursorType=Dot -PointerEventInterval=50 -AcceptClipboard=0 ${A}"
+            echo ""
+            echo "console: $(stat -f%Su /dev/console) / $(cat /tmp/cpw 2>/dev/null)"
+            echo "time UTC: $(date -u)"
             echo "=============================================================="
-            echo "--- RAW WEB LOG (yahan se manually bhi utha sakta hai) ---"
-            cat /tmp/web.log
-            echo "--- RAW TCP LOG ---"
             cat /tmp/tcp.log
-            echo "------------------------------------------------------------"
             for m in $(seq 1 50); do
               sleep 60
-              kill -0 "$W" 2>/dev/null || { echo "web tunnel died ${m}m"; break; }
-              [ $((m % 5)) -eq 0 ] && echo "[alive ${m}m] ${WEB}/vnc.html?autoconnect=true&password=mac12345&resize=scale&reconnect=true&path=websockify"
+              kill -0 "$T" 2>/dev/null || { echo "tunnel died ${m}m, restart"; break; }
+              [ $((m % 5)) -eq 0 ] && echo "[alive ${m}m] ${A}"
             done
-            kill "$W" "$T" 2>/dev/null; wait "$W" "$T" 2>/dev/null
-            echo "rotating tunnels..."
+            kill "$T" 2>/dev/null; wait "$T" 2>/dev/null
+            echo "rotating tunnel..."
           done
           EOF
           chmod +x /tmp/tun.sh
